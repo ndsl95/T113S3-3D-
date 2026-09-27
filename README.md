@@ -1,4 +1,4 @@
-# 亿百特 T113S4（全志 T113）3D 打印机固件镜像裁剪与烧录记录
+# 全志 T113 固件镜像裁剪与烧录记录（亿百特 T113S4 当读卡器 → T113S3 主机）
 
 将 58.42 GB 的原始整盘镜像裁剪到能塞进 16 GB TF 卡的 6.1 GB 镜像，并记录过程中踩过的坑。
 
@@ -6,10 +6,11 @@
 
 ## 1. 背景与目标
 
-- **硬件**：亿百特 T113S4 开发板（全志 T113，ARM Cortex-A7），**没有板载存储，系统完整装在 TF 卡上**，上电直接从 TF 卡启动。
-- **原始刷机包**：一张 TF 卡的整盘 dump，`disk.img`，大小 **58.42 GiB**（62,723,719,168 字节 / 122,507,264 扇区）。
-- **目标**：TF 卡只有 16 GB，装不下 58 GB，需要裁剪成 ≤16 GB 的可启动镜像。
-- **约束**：手边没有 TF 卡读卡器。
+- **目标主机**：另一块 **T113S3 主机**（全志 T113，ARM Cortex-A7），**无板载存储，必须从 TF 卡启动**。
+- **写卡工具**：**亿百特 T113S4 开发板**（本身有板载存储、能正常跑 Linux），本次**临时把它当 TF 卡读卡器用**——加载 `g_mass_storage` 把插在它上面的 TF 卡通过 USB OTG 暴露给电脑。
+- **原始刷机包**：目标主机的整盘镜像 `disk.img`，大小 **58.42 GiB**（62,723,719,168 字节 / 122,507,264 扇区）。
+- **目标**：TF 卡只有 16 GB，装不下 58 GB，需要裁剪成 ≤16 GB 的可启动镜像，写好后再插到目标主机上开机。
+- **约束**：手边没有独立的 TF 卡读卡器，只能借亿百特这块板子来写卡。
 
 ---
 
@@ -78,7 +79,7 @@ number of entries = 8, entry size = 128
   ```
 - 顺带把 dsp0 / private / UDISK 的数据也弄错了（与原镜像 md5 不一致）。
 
-**结果：镜像能挂载、能列出顶层目录，但文件系统内部已损坏，板子上电启动时卡在开机 logo 处。**
+**结果：镜像能挂载、能列出顶层目录，但文件系统内部已损坏。亿百特插着这张卡上电时（TF 卡优先启动）直接卡在开机 logo —— 一开始误以为是板子坏了，其实是卡里的镜像坏了。**
 
 ### 3.2 ✅ 正确做法
 
@@ -157,18 +158,20 @@ offset 8192: f0 00 00 ea 65 47 4f 4e  ("eGON.BT0")
 sudo dd if=disk_small.img of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 
-### 方法 B：板子自身当读卡器（板子能正常启动时）
+### 方法 B：用亿百特开发板当读卡器（本次采用的方案）
 
-板子跑的就是 TF 卡上的 Linux，可以加载 `g_mass_storage` 把 `/dev/mmcblk1` 通过 USB OTG 暴露给电脑，电脑上就会多出一个 U 盘：
+亿百特自己跑着 Linux（系统在**板载存储**上），加载 `g_mass_storage` 后，插在它上面的 TF 卡 `/dev/mmcblk1` 就会通过 USB OTG 暴露给电脑，电脑上多出一个 U 盘：
 
 ```bash
-# 板子端（通过 SSH）
-umount /dev/mmcblk1p1                 # 先卸载
-echo "" > /sys/kernel/config/usb_gadget/g1/UDC   # 断开已有 gadget
+# 在亿百特上（通过 SSH）
+umount /dev/mmcblk1p1                              # 先卸载 TF 卡
+echo "" > /sys/kernel/config/usb_gadget/g1/UDC      # 断开已有的 USB gadget
 modprobe g_mass_storage file=/dev/mmcblk1 removable=1 ro=0
 ```
 
-> ⚠️ 注意：系统本身就在这块卡上，直接整盘覆盖会破坏正在运行的系统（内存里能撑一会儿，重启即挂）。
+然后电脑上就能像普通 U 盘一样整盘写入（Windows 下用 `write_disk.ps1`，或 Linux 下 `dd`）。
+
+> ⚠️ 注意：亿百特上电时 **TF 卡优先启动**。一旦卡里被写入了可启动镜像，下次给亿百特上电它会优先去启动这张卡（本次就因为卡里还是坏镜像而卡在开机 logo）。所以写卡期间别重启这块板子，写完把卡拔下来即可。
 
 ### 方法 C：全志 FEL 模式（未走通，仅记录）
 
@@ -192,7 +195,7 @@ xfel sd write 0 disk_small.img   # 从偏移 0 开始写整盘镜像
 1. **Allwinner 的 GPT 不是标准 GPT**，分区表项在 LBA 73726，不能拿 `sgdisk/parted` 重建，否则会覆盖 8 KB 处的 boot0。改分区只能改分区表项里的起止 LBA。
 2. **ext4 缩小必须走 `resize2fs`**，手改 `s_blocks_count` / `s_inodes_count` 一定会损坏文件系统。
 3. 从运行中的系统 dump 出来的镜像，**journal 是脏的**，`resize2fs` 前必须先 `e2fsck -f`。
-4. **系统盘就是 TF 卡**：一旦覆盖卡，板子就再起不来，写卡必须借助外部读卡器（或 FEL）。
+4. **亿百特上电时 TF 卡优先启动**：往它插着的 TF 卡写入可启动镜像后，下次上电它会优先去启动这张卡（本次卡里还是坏镜像，于是直接卡在 logo）。写卡期间别重启亿百特，写完及时把卡拔下。
 5. 板子上被内核重新枚举的分区，**设备节点主次设备号要用 `/sys/block/mmcblk1/mmcblk1pN/dev` 里的真实值**（这里是 `179:5`），自己 `mknod` 猜号会挂载失败。
 6. Windows PowerShell 脚本里**中文路径会因编码被改写**（`铝合金` 变乱码导致"路径不存在"），脚本内尽量改用纯 ASCII 路径。
 7. 可移动磁盘**不能** `Set-Disk -IsOffline`（会报 `Removable media cannot be set to offline`），要先 `mountvol X: /P` 摘盘符再用 `\\.\PhysicalDriveN` 写。
