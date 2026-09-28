@@ -1,0 +1,62 @@
+#!/bin/sh
+#
+# Start the LVGL framebuffer UI on the T113-S3 3D printer board.
+#
+
+APP=/home/wqf/lvgl-demo
+PIDFILE=/var/run/lvgl.pid
+LOGFILE=/var/log/lvgl.log
+
+start()
+{
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        return 0
+    fi
+
+    # The stock Qt UI crashes on this rootfs; make sure it never keeps
+    # holding the framebuffer.
+    killall XC_PRO_5inch 2>/dev/null
+
+    if [ ! -x "$APP" ]; then
+        echo "LVGL executable not found: $APP" >&2
+        return 1
+    fi
+
+    mkdir -p /var/log
+
+    export LV_LINUX_FBDEV_DEVICE=/dev/fb0
+    export LV_LINUX_EVDEV_POINTER_DEVICE=/dev/input/event1
+
+    nohup "$APP" >>"$LOGFILE" 2>&1 </dev/null &
+    echo $! >"$PIDFILE"
+
+    echo "Starting LVGL UI: OK"
+}
+
+stop()
+{
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+    killall lvgl-demo 2>/dev/null
+    echo "Stopping LVGL UI: OK"
+}
+
+case "$1" in
+    start|"")
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        sleep 1
+        start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}" >&2
+        exit 1
+        ;;
+esac
