@@ -36,7 +36,7 @@ echo "work     : $WORK"
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
-for f in main.c evdev_touch.c CMakeLists.txt lv_conf.h lv_font_cn_22.c lv_font_cn_32.c; do
+for f in main.c evdev_touch.c CMakeLists.txt lv_conf.h lv_font_cn_22.c lv_font_cn_32.c lv_font_ssid.c; do
     [ -f "$SRC_DIR/$f" ] || { echo "缺少源文件: $f"; exit 1; }
     cp "$SRC_DIR/$f" "$WORK/$f"
     # Windows 端写出的文件可能带 UTF-8 BOM，去掉
@@ -44,8 +44,8 @@ for f in main.c evdev_touch.c CMakeLists.txt lv_conf.h lv_font_cn_22.c lv_font_c
 done
 ln -sfn "$LVGL_SRC" "$WORK/lvgl"
 
-# 让 lv_conf.h 声明界面用的两个中文字库
-sed -i "s|^#define LV_FONT_CUSTOM_DECLARE.*$|#define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(lv_font_cn_22) LV_FONT_DECLARE(lv_font_cn_32)|" "$WORK/lv_conf.h"
+# 让 lv_conf.h 声明界面用的中文字库（ssid 那套是给热点名用的全 CJK 字库）
+sed -i "s|^#define LV_FONT_CUSTOM_DECLARE.*$|#define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(lv_font_cn_22) LV_FONT_DECLARE(lv_font_cn_32) LV_FONT_DECLARE(lv_font_ssid)|" "$WORK/lv_conf.h"
 grep -n "LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE" "$WORK/lv_conf.h"
 
 cat > "$WORK/toolchain-t113.cmake" <<'EOF'

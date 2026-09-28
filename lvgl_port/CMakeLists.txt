@@ -12,6 +12,7 @@ add_executable(lvgl-demo
     evdev_touch.c
     lv_font_cn_22.c
     lv_font_cn_32.c
+    lv_font_ssid.c
 )
 target_link_libraries(lvgl-demo lvgl m pthread)
 

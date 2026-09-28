@@ -633,7 +633,9 @@
 /** Enable handling large font and/or fonts with a lot of characters.
  *  The limit depends on the font size, font face and bpp.
  *  A compiler error will be triggered if a font needs it. */
-#define LV_FONT_FMT_TXT_LARGE 0
+/* ssid 那套字库覆盖全部 CJK 汉字，位图超过 1MB，必须用 32 位的 bitmap_index。
+   三种字库都由同一份 lv_conf.h 编译，索引变宽对已有字库没有影响。 */
+#define LV_FONT_FMT_TXT_LARGE 1
 
 /** Enables/disables support for compressed fonts. */
 #define LV_USE_FONT_COMPRESSED 0
@@ -784,6 +786,9 @@
 #define LV_USE_TEXTAREA   1   /**< Requires: lv_label */
 #if LV_USE_TEXTAREA != 0
     #define LV_TEXTAREA_DEF_PWD_SHOW_TIME 1500    /**< [ms] */
+    /* 密码圆点。默认的 U+2022 不在界面用的中文字库里（会画成占位方块），
+       用 ASCII 的 '*' 代替，任何字库都有。 */
+    #define LV_TEXTAREA_PWD_BULLET_UNICODE 0x2A
 #endif
 
 #define LV_USE_TILEVIEW   1

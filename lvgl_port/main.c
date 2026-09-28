@@ -58,6 +58,10 @@ static lv_obj_t * sw_fan;
 
 #define WIFI_MAX_AP     24
 #define WIFI_SSID_MAX   64
+/* wpa_cli 会把 SSID 的每个字节写成 "\xNN"，最坏情况是 4 倍长度。
+ * 凡是接这种转义串的缓冲区都得按这个尺寸来，否则中文 SSID 会被截断
+ * （截断点还可能落在转义中间，显示成 "\xe" 这种半截东西）。 */
+#define WIFI_SSID_ESC_MAX  (WIFI_SSID_MAX * 4 + 4)
 #define WIFI_MSG_MAX    160
 
 typedef struct {
@@ -198,6 +202,40 @@ static void trim_eol(char * s)
     while(n > 0 && (s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == ' ')) s[--n] = '\0';
 }
 
+/* wpa_cli 会把 SSID 里的非 ASCII 字节按 \xNN 转义输出
+ * （中文热点名会变成 "\xe4\xb8\xad\xe9\x93\x81..."），
+ * 这里还原成真正的 UTF-8 字节序列，否则界面上显示的就是这串转义文本。
+ * 所有从 wpa_cli 输出里取 SSID 的地方都要过一遍这个函数，
+ * 否则连接时"目标 SSID 是否真的连上"的比较会因为一边带转义而永远不相等。 */
+static int is_hex_digit(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static void unescape_ssid(const char * in, char * out, size_t outsz)
+{
+    size_t o = 0;
+
+    for(size_t i = 0; in[i] && o + 1 < outsz; ) {
+        if(in[i] == '\\' && in[i + 1] == 'x' && is_hex_digit(in[i + 2]) && is_hex_digit(in[i + 3])) {
+            unsigned v = 0;
+            for(int k = 2; k <= 3; k++) {
+                char c = in[i + k];
+                v <<= 4;
+                if(c <= '9')      v |= (unsigned)(c - '0');
+                else if(c <= 'F') v |= (unsigned)(c - 'A' + 10);
+                else              v |= (unsigned)(c - 'a' + 10);
+            }
+            out[o++] = (char)v;
+            i += 4;
+        }
+        else {
+            out[o++] = in[i++];
+        }
+    }
+    out[o] = '\0';
+}
+
 /* ============================ WiFi 后台任务 ============================ */
 
 static pthread_t g_wifi_thr;
@@ -206,11 +244,13 @@ static void wifi_read_status(void)
 {
     char out[1024];
     char state[32] = "";
-    char ssid[WIFI_SSID_MAX] = "";
+    char ssid[WIFI_SSID_ESC_MAX] = "";
+    char ssid_u[WIFI_SSID_MAX] = "";
 
     run_cmd("wpa_cli -i wlan0 status 2>/dev/null", out, sizeof(out));
     status_field(out, "wpa_state", state, sizeof(state));
     status_field(out, "ssid", ssid, sizeof(ssid));
+    unescape_ssid(ssid, ssid_u, sizeof(ssid_u));
 
     run_cmd("ifconfig wlan0 2>/dev/null", out, sizeof(out));
     char * c = strstr(out, "inet addr:");
@@ -227,8 +267,8 @@ static void wifi_read_status(void)
         snprintf(g_cur_ip, sizeof(g_cur_ip), "-");
     }
 
-    if(strcmp(state, "COMPLETED") == 0 && ssid[0]) {
-        snprintf(g_cur_ssid, sizeof(g_cur_ssid), "%s", ssid);
+    if(strcmp(state, "COMPLETED") == 0 && ssid_u[0]) {
+        snprintf(g_cur_ssid, sizeof(g_cur_ssid), "%s", ssid_u);
     }
     else {
         snprintf(g_cur_ssid, sizeof(g_cur_ssid), "未连接");
@@ -261,19 +301,22 @@ static int wifi_parse_scan(const char * out)
         if(nf >= 5 && f[4][0]) {
             int sig;
             int dup = 0;
+            char ssid_u[WIFI_SSID_MAX];
+
             trim_eol(f[4]);
+            unescape_ssid(f[4], ssid_u, sizeof(ssid_u));
             sig = atoi(f[2]);
-            if(f[4][0] == '\0') { ln = strtok_r(NULL, "\n", &save1); continue; }
+            if(ssid_u[0] == '\0') { ln = strtok_r(NULL, "\n", &save1); continue; }
 
             for(int i = 0; i < cnt; i++) {
-                if(strcmp(g_ap[i].ssid, f[4]) == 0) {
+                if(strcmp(g_ap[i].ssid, ssid_u) == 0) {
                     dup = 1;
                     if(sig > g_ap[i].signal) g_ap[i].signal = sig;
                     break;
                 }
             }
             if(!dup) {
-                snprintf(g_ap[cnt].ssid, sizeof(g_ap[cnt].ssid), "%s", f[4]);
+                snprintf(g_ap[cnt].ssid, sizeof(g_ap[cnt].ssid), "%s", ssid_u);
                 g_ap[cnt].signal = sig;
                 cnt++;
             }
@@ -347,9 +390,13 @@ static int wifi_select_by_ssid(const char * ssid)
             f[nf++] = tk;
             tk = strtok_r(NULL, "\t", &save2);
         }
-        if(nf >= 2 && strcmp(f[1], ssid) == 0) {
-            found = atoi(f[0]);
-            break;
+        if(nf >= 2) {
+            char list_ssid[WIFI_SSID_MAX];
+            unescape_ssid(f[1], list_ssid, sizeof(list_ssid));
+            if(strcmp(list_ssid, ssid) == 0) {
+                found = atoi(f[0]);
+                break;
+            }
         }
         ln = strtok_r(NULL, "\n", &save);
     }
@@ -382,7 +429,7 @@ static void wifi_job_connect(void)
     char ssid_e[200];
     char psk_e[200];
     char prev_ssid[WIFI_SSID_MAX];
-    char got_ssid[WIFI_SSID_MAX];
+    char got_ssid[WIFI_SSID_ESC_MAX];
     int  id = -1;
     int  ok = 0;
 
@@ -433,6 +480,8 @@ static void wifi_job_connect(void)
         got_ssid[0] = '\0';
         run_cmd("wpa_cli -i wlan0 status 2>/dev/null", out, sizeof(out));
         status_field(out, "ssid", got_ssid, sizeof(got_ssid));
+        /* 原地反转义是安全的：输出下标永远不超前于输入下标 */
+        unescape_ssid(got_ssid, got_ssid, sizeof(got_ssid));
         if(strstr(out, "wpa_state=COMPLETED") && strcmp(got_ssid, g_pending_ssid) == 0) {
             ok = 1;
             break;
@@ -586,6 +635,7 @@ static void make_button(lv_obj_t * parent, const char * text, lv_color_t color,
     lv_obj_t * l = lv_label_create(btn);
     lv_label_set_text(l, text);
     lv_obj_set_style_text_font(l, &lv_font_cn_32, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_center(l);
 }
 
@@ -683,18 +733,22 @@ static void printer_build(void)
     lv_obj_remove_flag(right, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t * wifi_btn = lv_button_create(right);
-    lv_obj_set_size(wifi_btn, 130, 56);
+    lv_obj_set_size(wifi_btn, 168, 56);
     lv_obj_set_style_bg_color(wifi_btn, COL_WIFI, LV_PART_MAIN);
     lv_obj_set_style_radius(wifi_btn, 12, LV_PART_MAIN);
     lv_obj_set_style_shadow_width(wifi_btn, 0, LV_PART_MAIN);
+    /* 主题给的左右内边距会吃掉按钮宽度，32px 的 "WiFi" 会被裁成 "iFi" */
+    lv_obj_set_style_pad_hor(wifi_btn, 6, LV_PART_MAIN);
     lv_obj_add_event_cb(wifi_btn, open_wifi_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * wl = lv_label_create(wifi_btn);
     lv_label_set_text(wl, "WiFi");
     lv_obj_set_style_text_font(wl, &lv_font_cn_32, LV_PART_MAIN);
+    lv_obj_set_style_text_color(wl, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_center(wl);
 
     lbl_status = lv_label_create(right);
     lv_label_set_text(lbl_status, "待机");
+    lv_obj_set_style_text_color(lbl_status, COL_TEXT, LV_PART_MAIN);
 
     /* ---- 主体 ---- */
     lv_obj_t * body = lv_obj_create(scr_main);
@@ -737,10 +791,12 @@ static void printer_build(void)
     lv_obj_t * r6 = make_row(c5);
     lv_obj_t * fan_lbl = lv_label_create(r6);
     lv_label_set_text(fan_lbl, "风扇");
+    lv_obj_set_style_text_color(fan_lbl, COL_TEXT, LV_PART_MAIN);
     sw_fan = lv_switch_create(r6);
     lv_obj_add_event_cb(sw_fan, fan_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lbl_fan_state = lv_label_create(r6);
     lv_label_set_text(lbl_fan_state, "关");
+    lv_obj_set_style_text_color(lbl_fan_state, COL_TEXT, LV_PART_MAIN);
 
     make_title_label(c5, "亮度");
     lv_obj_t * slider = lv_slider_create(c5);
@@ -848,6 +904,8 @@ static void wifi_refresh_list(void)
 
         lv_obj_t * l = lv_label_create(b);
         lv_label_set_text_fmt(l, "%s    %d dBm", g_ap[i].ssid, g_ap[i].signal);
+        /* 热点名什么字都可能出现，用覆盖全 CJK 的字库 */
+        lv_obj_set_style_text_font(l, &lv_font_ssid, LV_PART_MAIN);
         lv_obj_center(l);
     }
 }
@@ -888,7 +946,60 @@ static void wifi_timer_cb(lv_timer_t * t)
 }
 
 /* 键盘按钮高度：交给 flex 拉伸会把按键拉得过高，这里给固定高度 */
-#define WIFI_KB_HEIGHT 380
+#define WIFI_KB_HEIGHT 480
+
+/* 键面文字用的是 buttonmatrix 的 LV_PART_ITEMS 字体：不显式设置的话，这一路
+ * 查不到继承值，会退回 LV_FONT_DEFAULT（montserrat_14）。14px 在 720x1280
+ * 的小屏上就是"糊"的观感，这里统一换成 32px。montserrat 同时带 LVGL 的
+ * 功能键符号（退格/回车/关闭），中文字库没有这些。
+ */
+#define KB_FONT (&lv_font_montserrat_32)
+
+/* 自定义符号页。
+ *
+ * LVGL 内置的 SPECIAL 页缺少 WiFi 密码里很常见的 '!'、'^'、'{' 等符号，
+ * 这里重排一页：第 2 行第 2 个键就是 '!'，一眼能看到。
+ * 保留 LVGL 约定的 "abc" 键（点击会切回小写字母页）。
+ * 行内按键数：11 + 12 + 12 + 5 = 40。
+ */
+static const char * const kb_map_sym[] = {
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", LV_SYMBOL_BACKSPACE, "\n",
+    "abc", "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "-", "\n",
+    "_", "=", "+", "[", "]", "{", "}", ";", ":", "'", "\"", "/", "\n",
+    LV_SYMBOL_KEYBOARD, LV_SYMBOL_LEFT, " ", LV_SYMBOL_RIGHT, LV_SYMBOL_OK, ""
+};
+
+/* 每个按键的宽度/标志，条目数必须和 kb_map_sym 的按键数严格一致（40 个） */
+static const lv_buttonmatrix_ctrl_t kb_ctrl_sym[] = {
+    /* 第 1 行 */
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_CHECKED | 2,
+    /* 第 2 行 */
+    LV_KEYBOARD_CTRL_BUTTON_FLAGS | 2,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    /* 第 3 行 */
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1, LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    /* 第 4 行 */
+    LV_KEYBOARD_CTRL_BUTTON_FLAGS | 2,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 2,
+    LV_BUTTONMATRIX_CTRL_POPOVER | 1,
+    LV_KEYBOARD_CTRL_BUTTON_FLAGS | 2
+};
 
 static void wifi_pwd_box_build(void)
 {
@@ -911,9 +1022,11 @@ static void wifi_pwd_box_build(void)
     lv_obj_t * t = lv_label_create(wifi_pwd_box);
     lv_label_set_text(t, "输入密码");
     lv_obj_set_style_text_font(t, &lv_font_cn_32, LV_PART_MAIN);
+    lv_obj_set_style_text_color(t, COL_TEXT, LV_PART_MAIN);
 
     wifi_lbl_pwd_ssid = lv_label_create(wifi_pwd_box);
     lv_label_set_text(wifi_lbl_pwd_ssid, "");
+    lv_obj_set_style_text_font(wifi_lbl_pwd_ssid, &lv_font_ssid, LV_PART_MAIN);
     lv_obj_set_style_text_color(wifi_lbl_pwd_ssid, COL_TEXT_DIM, LV_PART_MAIN);
 
     wifi_ta = lv_textarea_create(wifi_pwd_box);
@@ -922,6 +1035,7 @@ static void wifi_pwd_box_build(void)
     lv_textarea_set_one_line(wifi_ta, true);
     lv_textarea_set_password_mode(wifi_ta, true);
     lv_textarea_set_placeholder_text(wifi_ta, "密码");
+    lv_obj_set_style_text_font(wifi_ta, &lv_font_cn_32, LV_PART_MAIN);
 
     lv_obj_t * row = lv_obj_create(wifi_pwd_box);
     lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
@@ -935,8 +1049,15 @@ static void wifi_pwd_box_build(void)
     make_button(row, "连接", COL_START, 84, pwd_connect_cb, NULL);
     make_button(row, "取消", COL_STOP,  84, pwd_cancel_cb, NULL);
 
+    lv_obj_t * kb_hint = lv_label_create(wifi_pwd_box);
+    lv_label_set_text(kb_hint, "点 1# 键输入符号");
+    lv_obj_set_style_text_color(kb_hint, COL_TEXT_DIM, LV_PART_MAIN);
+
     wifi_kb = lv_keyboard_create(wifi_pwd_box);
     lv_obj_set_size(wifi_kb, lv_pct(100), WIFI_KB_HEIGHT);
+    lv_obj_set_style_text_font(wifi_kb, KB_FONT, LV_PART_MAIN);
+    lv_obj_set_style_text_font(wifi_kb, KB_FONT, LV_PART_ITEMS);
+    lv_keyboard_set_map(wifi_kb, LV_KEYBOARD_MODE_SPECIAL, kb_map_sym, kb_ctrl_sym);
     lv_keyboard_set_textarea(wifi_kb, wifi_ta);
 }
 
@@ -980,6 +1101,7 @@ static void wifi_build(void)
     lv_obj_t * bl = lv_label_create(back);
     lv_label_set_text(bl, "返回");
     lv_obj_set_style_text_font(bl, &lv_font_cn_32, LV_PART_MAIN);
+    lv_obj_set_style_text_color(bl, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_center(bl);
 
     /* ---- 状态卡片 ---- */
@@ -997,6 +1119,7 @@ static void wifi_build(void)
     lv_obj_t * r1 = make_row(card);
     make_title_label(r1, "当前网络");
     wifi_lbl_ssid = make_big_label(r1, "未连接", COL_TEXT);
+    lv_obj_set_style_text_font(wifi_lbl_ssid, &lv_font_ssid, LV_PART_MAIN);
     lv_obj_t * r2 = make_row(card);
     make_title_label(r2, "IP 地址");
     wifi_lbl_ip = make_big_label(r2, "-", COL_TEXT);
