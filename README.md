@@ -296,7 +296,10 @@ bootcmd=run setargs_mmc boot_dsp0 boot_normal
 
 ## 10. 当前状态与待办
 
-- ✅ 镜像已修正 GPT：`disk_small.img` = **6,535,794,176 字节**（`sgdisk -v` 校验通过），rootfs 4G / dsp0 1M / private 16M / UDISK 2G
+- ✅ 镜像已修正 GPT，提供**两个版本**（都通过 `sgdisk -v`）：
+  - `disk_small.img` = **6,535,794,176 字节** —— rootfs 4G / dsp0 1M / private 16M / **UDISK 2G（内容置零）**
+  - `disk_full.img`  = **15,479,078,400 字节** —— 只缩 rootfs，**UDISK 保留原始 10.3GB 完整内容**（16GB 卡刚好装得下）
+- 注：原盘 `UDISK` 里的数据是"每 1MB 高度重复的图案"（疑似出厂填充或加密），无法确定是否有用，故额外做一版保真镜像兜底
 - ⚠️ **尚未验证能否在目标 T113S3 主机上启动** —— 主机仍然卡在开机 logo
 - 待办（需要硬件）：
   1. **TF 读卡器**：把修正后的镜像写进 TF 卡（`dd` / balenaEtcher 均可）
