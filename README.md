@@ -230,6 +230,7 @@ xfel sd write 0 disk_small.img   # 从偏移 0 开始写整盘镜像
 5. 板子上被内核重新枚举的分区，**设备节点主次设备号要用 `/sys/block/mmcblk1/mmcblk1pN/dev` 里的真实值**（这里是 `179:5`），自己 `mknod` 猜号会挂载失败。
 6. Windows PowerShell 脚本里**中文路径会因编码被改写**（`铝合金` 变乱码导致"路径不存在"），脚本内尽量改用纯 ASCII 路径。
 7. 可移动磁盘**不能** `Set-Disk -IsOffline`（会报 `Removable media cannot be set to offline`），要先 `mountvol X: /P` 摘盘符再用 `\\.\PhysicalDriveN` 写。
+8. **GPT 的备份分区表必须有地方放**：如果把镜像总大小设成"正好等于最后一个分区的末尾"，分区 8 就会压在备份 GPT 上、且 `last usable` 小于分区末尾 —— 这属于**不合法 GPT**（注意：主分区表 CRC 可以是对的，`fdisk` 也不一定报错，容易被忽略）。正确做法是镜像末尾多留 33 个扇区给备份 GPT，改完用 `sgdisk -v` 校验应显示 *No problems found*。
 
 ---
 
@@ -247,8 +248,13 @@ xfel sd write 0 disk_small.img   # 从偏移 0 开始写整盘镜像
     ├── rebuild.sh               ★ 正确的裁剪重建脚本（e2fsck + resize2fs + 回填）
     ├── fix_superblock.py        （第一版错误思路的补救）修补镜像里的 ext4 超级块
     ├── fix_sb_board.py          直接在板子上修补 TF 卡里的 ext4 超级块
+    ├── fix_gpt.py               ★ 修复 GPT：镜像末尾留出备份表空间 + 重算两级表/CRC
+    ├── verify_gpt_crc.py        校验 GPT 头部/分区表 CRC 是否正确
     ├── verify_rebuild.sh        重建后校验（fdisk / e2fsck / 挂载 / 文件数比对）
     ├── check_all_bgs.py         检查所有备份超级块的值是否一致
+    ├── check_orig_parts.sh      检查原始镜像各分区（private/UDISK 是否为空、boot 格式）
+    ├── cmp_head.sh              逐块比对预留引导区 + p1~p4（只应 GPT 相关块不同）
+    ├── peek_boot.sh             抠出 boot 分区头部信息
     ├── check_board.sh           查看板子系统与存储状态
     ├── check_gadget.sh          查看板子 USB gadget 状态与可用模块
     ├── enable_mass_storage.sh   把 TF 卡通过 USB OTG 暴露成 U 盘（板子当读卡器）
@@ -262,3 +268,38 @@ xfel sd write 0 disk_small.img   # 从偏移 0 开始写整盘镜像
 ## 8. 一句话总结
 
 > 裁剪全志（Allwinner）整盘镜像时：**GPT 千万别用标准工具重建**（会覆盖 boot0），**文件系统一定要用 `e2fsck` + `resize2fs` 真缩**（别手改超级块数字）。
+
+---
+
+## 9. 启动链分析（从 env 分区读出来的）
+
+`env`（p2）里存着 U-Boot 的启动配置：
+
+```
+earlycon=uart8250,mmio32,0x05000000
+console=ttyS3,115200
+init=/init
+mmc_root=/dev/mmcblk0p5
+dsp0_partition=dsp0
+setargs_mmc=setenv bootargs ... root=${mmc_root} init=${init} partitions=${partitions} ...
+boot_dsp0=sunxi_flash read 43000000 ${dsp0_partition}; bootr 43000000 0 0
+boot_normal=sunxi_flash read 43000000 boot; bootm 43000000
+bootcmd=run setargs_mmc boot_dsp0 boot_normal
+```
+
+要点：
+
+1. **根文件系统固定是第 5 分区**（`/dev/mmcblk0p5`）→ 裁剪时 **p5 的起始扇区必须保持不变**（本次保持不变：147462）。
+2. U-Boot 用 `sunxi_flash read <addr> <分区名>` **按分区名**读 `dsp0` / `boot` → **分区名和 GPT 必须完全对得上**。
+3. 内核从 `boot` 分区加载，格式是 `ANDROID!`（Allwinner boot image，`bootm 43000000`）。
+4. 串口参数：**ttyS3 @ 115200 8N1**（排查问题就接这个口）。
+
+## 10. 当前状态与待办
+
+- ✅ 镜像已修正 GPT：`disk_small.img` = **6,535,794,176 字节**（`sgdisk -v` 校验通过），rootfs 4G / dsp0 1M / private 16M / UDISK 2G
+- ⚠️ **尚未验证能否在目标 T113S3 主机上启动** —— 主机仍然卡在开机 logo
+- 待办（需要硬件）：
+  1. **TF 读卡器**：把修正后的镜像写进 TF 卡（`dd` / balenaEtcher 均可）
+  2. **串口线**（接主板 `ttyS3`，115200）：抓开机日志，定位卡在 U-Boot 还是内核/rootfs
+- 已有线索：GPT 的备份表位置问题（已修）；`UDISK`/`private` 并非全空（UDISK 是每 1MB 重复的填充数据，非文件系统）；分区 GUID 与原始一致；预留引导区与原始逐字节一致
+
