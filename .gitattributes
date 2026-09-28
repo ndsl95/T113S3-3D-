@@ -1,0 +1,13 @@
+# 本机 core.autocrlf=true，默认检出会把文本转成 CRLF。
+# 但这些文件必须是 LF，否则会直接跑不起来：
+#   - lvgl_port/build.sh 在 WSL 里用 bash 执行
+#   - lvgl_port/S99lvgl 直接拷到板子上用 sh 执行
+#   - C 源码 / 字库保持 LF，避免无意义的整文件差异
+lvgl_port/build.sh      text eol=lf
+lvgl_port/S99lvgl       text eol=lf
+lvgl_port/*.c           text eol=lf
+lvgl_port/*.h           text eol=lf
+lvgl_port/tools/*.ps1   text eol=lf
+
+# 二进制产物不做换行转换
+lvgl_port/dist/*        -text
