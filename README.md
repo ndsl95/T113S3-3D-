@@ -146,11 +146,42 @@ p6 dsp0 md5: cf57ff401e364a6674c583982fc0be07（两者相同）
 offset 8192: f0 00 00 ea 65 47 4f 4e  ("eGON.BT0")
 ```
 
+写入 TF 卡后，再在板子上直接复核一遍：
+
+```
+fdisk -l /dev/mmcblk1        # 8 个分区：rootfs 4096M / dsp0 1M / private 16M / UDISK 2048M
+e2fsck -f -n /dev/mmcblk1p5  # 20583/262144 files, 303169/1048576 blocks（干净无错）
+mount /dev/mmcblk1p5 /tmp/vv # 3.9G 总 / 992M 已用 / 2.9G 可用，目录结构完整
+md5sum /dev/mmcblk1p6        # cf57ff401e364a6674c583982fc0be07（与原始 dsp0 一致）
+```
+
 ---
 
 ## 5. 烧录方法
 
-### 方法 A：读卡器（推荐，最稳）
+### 方法 A：串口 + WiFi + SSH 流式写入（本次实际采用的方案，成功）
+
+板子有调试串口（CH340 → COM3，115200）且有 WiFi。板子系统正常运行时，可以**完全不借助读卡器**，直接把镜像"流"进 TF 卡：
+
+```bash
+# 1) 串口(115200)进入板子 shell，先把网络弄通
+wpa_cli -i wlan0 status            # 确认已关联到 AP
+udhcpc -i wlan0                    # DHCP 拿 IP（本次拿到 192.168.110.11）
+
+# 2) 释放 TF 卡（若之前用过 g_mass_storage，要先卸载）
+rmmod g_mass_storage
+umount /dev/mmcblk1p1
+
+# 3) 在电脑上流式写入板子的 TF 卡（板子端不需要额外空间）
+dd if=disk_small.img bs=4M status=progress | \
+  ssh root@192.168.110.11 'dd of=/dev/mmcblk1 bs=4M; sync'
+```
+
+实测 ≈12–13 MB/s（WiFi），6.5 GB 约 9 分钟。
+
+> ⚠️ **重要踩坑**：Windows 上**无法**用 PowerShell/.NET 对"可移动 U 盘"做整盘裸写 —— 即使管理员权限也会报 `设备未就绪`（ERROR_NOT_READY）。所以"板子当读卡器 + 电脑裸写"这条在 Windows 下走不通，改用本方法最省事。
+
+### 方法 B：读卡器（最通用）
 
 ```
 # Windows：用 balenaEtcher / Win32DiskImager 直接写 disk_small.img
@@ -158,7 +189,7 @@ offset 8192: f0 00 00 ea 65 47 4f 4e  ("eGON.BT0")
 sudo dd if=disk_small.img of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 
-### 方法 B：用亿百特开发板当读卡器（本次采用的方案）
+### 方法 C：用亿百特开发板当读卡器（USB gadget）
 
 亿百特自己跑着 Linux（系统在**板载存储**上），加载 `g_mass_storage` 后，插在它上面的 TF 卡 `/dev/mmcblk1` 就会通过 USB OTG 暴露给电脑，电脑上多出一个 U 盘：
 
@@ -173,7 +204,7 @@ modprobe g_mass_storage file=/dev/mmcblk1 removable=1 ro=0
 
 > ⚠️ 注意：亿百特上电时 **TF 卡优先启动**。一旦卡里被写入了可启动镜像，下次给亿百特上电它会优先去启动这张卡（本次就因为卡里还是坏镜像而卡在开机 logo）。所以写卡期间别重启这块板子，写完把卡拔下来即可。
 
-### 方法 C：全志 FEL 模式（未走通，仅记录）
+### 方法 D：全志 FEL 模式（未走通，仅记录）
 
 芯片无引导介质时会自动进入 USB FEL 模式（电脑端识别为 `VID_1F3A:PID_EFE8`），理论上可用 **`xfel`** 直接写 SD 卡：
 
@@ -222,7 +253,8 @@ xfel sd write 0 disk_small.img   # 从偏移 0 开始写整盘镜像
     ├── check_gadget.sh          查看板子 USB gadget 状态与可用模块
     ├── enable_mass_storage.sh   把 TF 卡通过 USB OTG 暴露成 U 盘（板子当读卡器）
     ├── umount_sd.sh             卸载板子上的 TF 卡挂载点
-    └── write_disk.ps1           Windows 端：直接写 USB 磁盘（配方法 B 使用）
+    ├── write_disk.ps1           Windows 端：直接写 USB 磁盘（配方法 C 使用）
+    └── serial_cmd.ps1           Windows 端：通过板子调试串口(COM3,115200)执行命令（方法 A 用）
 ```
 
 ---
